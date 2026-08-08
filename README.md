@@ -1,3 +1,7 @@
+> **This is a fork** of [rltakashige/mlx-lm@leo/deepseek-v4](https://github.com/rltakashige/mlx-lm/tree/leo/deepseek-v4),
+> tracking upstream [ml-explore/mlx-lm](https://github.com/ml-explore/mlx-lm) — see [FORK.md](./FORK.md)
+> for why it exists, what differs, and which branch to use.
+
 ## MLX LM 
 
 MLX LM is a Python package for generating text and fine-tuning large language
