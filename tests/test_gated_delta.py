@@ -155,6 +155,60 @@ class TestGatedDeltaPacked(unittest.TestCase):
                 self.assertTrue(mx.array_equal(y_d, y_u))
                 self.assertTrue(mx.array_equal(s_d, s_u))
 
+    def test_masked_generic_matches_ops_reference(self):
+        """A ragged padding mask must match the ops reference at valid positions.
+
+        test_unsupported_shapes_fall_back only proves the masked path routes to
+        the generic kernel; its mask is all-ones, so it cannot detect a
+        mask-handling bug. This one masks real positions off.
+        """
+        q, k, v, a, b, A_log, dt_bias, state = _make_inputs(
+            2, 33, 8, 16, 128, 128, mx.bfloat16
+        )
+        mask = mx.arange(33)[None] < mx.array([[29], [17]])
+        y_k, s_k = gated_delta_kernel(q, k, v, a, b, A_log, dt_bias, state, mask)
+        g = compute_g(A_log, a, dt_bias)
+        beta = mx.sigmoid(b.astype(mx.float32))
+        y_r, s_r = gated_delta_ops(q, k, v, g, beta, state, mask)
+        mx.eval(y_k, s_k, y_r, s_r)
+        # Outputs at padded positions are unspecified (the kernel zeros them,
+        # the ops reference does not); compare valid positions only.
+        valid = mask[..., None, None]
+        y_k = mx.where(valid, y_k, 0)
+        y_r = mx.where(valid, y_r, 0)
+        self.assertLess(_rel_l2(y_k, y_r), 2e-3)
+        self.assertLess(_rel_l2(s_k, s_r), 2e-3)
+
+    def test_vector_gate_generic_matches_ops_reference(self):
+        """A [B, T, Hv, Dk] gate takes the vectorized kernel; pin it to ops."""
+        q, k, v, _, b, A_log, dt_bias, state = _make_inputs(
+            1, 65, 4, 8, 128, 128, mx.bfloat16
+        )
+        a_vec = (mx.random.normal((1, 65, 8, 128)) * 0.5).astype(mx.bfloat16)
+        mx.eval(a_vec)
+        y_k, s_k = gated_delta_kernel(q, k, v, a_vec, b, A_log, dt_bias, state, None)
+        # The vectorized kernel varies a per Dk element but still indexes A_log
+        # and dt_bias per head, so broadcast them over Dk to match it.
+        g = compute_g(A_log[:, None], a_vec, dt_bias[:, None])
+        beta = mx.sigmoid(b.astype(mx.float32))
+        y_r, s_r = gated_delta_ops(q, k, v, g, beta, state, None)
+        mx.eval(y_k, s_k, y_r, s_r)
+        self.assertLess(_rel_l2(y_k, y_r), 2e-3)
+        self.assertLess(_rel_l2(s_k, s_r), 2e-3)
+
+    def test_small_head_dim_generic_matches_ops_reference(self):
+        """Dk != 128 takes the generic kernel; pin it to ops, not just to itself."""
+        q, k, v, a, b, A_log, dt_bias, state = _make_inputs(
+            1, 65, 4, 8, 64, 64, mx.bfloat16
+        )
+        y_k, s_k = gated_delta_kernel(q, k, v, a, b, A_log, dt_bias, state, None)
+        g = compute_g(A_log, a, dt_bias)
+        beta = mx.sigmoid(b.astype(mx.float32))
+        y_r, s_r = gated_delta_ops(q, k, v, g, beta, state, None)
+        mx.eval(y_k, s_k, y_r, s_r)
+        self.assertLess(_rel_l2(y_k, y_r), 2e-3)
+        self.assertLess(_rel_l2(s_k, s_r), 2e-3)
+
     def test_vector_gate_falls_back(self):
         """A [B, T, Hv, Dk] gate must keep the vectorized kernel."""
         q, k, v, _, b, A_log, dt_bias, state = _make_inputs(
