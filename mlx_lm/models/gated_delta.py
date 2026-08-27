@@ -21,6 +21,15 @@ def compute_g(A_log, a, dt_bias):
     return mx.exp(-mx.exp(A_log.astype(mx.float32)) * nn.softplus(a + dt_bias))
 
 
+def compute_lower_bound_g(A_log, a, dt_bias, lower_bound):
+    return mx.exp(
+        lower_bound
+        * mx.sigmoid(
+            mx.exp(A_log.astype(mx.float32)) * (a.astype(mx.float32) + dt_bias)
+        )
+    )
+
+
 def _make_gated_delta_kernel(has_mask=False, vectorized=False):
     if not mx.metal.is_available():
         return None
@@ -677,6 +686,7 @@ def gated_delta_update(
     state: Optional[mx.array] = None,
     mask: Optional[mx.array] = None,
     use_kernel: bool = True,
+    lower_bound: Optional[float] = None,
 ) -> Tuple[mx.array, mx.array]:
     beta = mx.sigmoid(b)
     g = compute_g(A_log, a, dt_bias)
@@ -685,9 +695,21 @@ def gated_delta_update(
         Hv, Dv = v.shape[-2:]
         state = mx.zeros((B, Hv, Dv, Dk), dtype=mx.float32)
 
-    if not use_kernel or mx.default_device() != mx.gpu or not mx.metal.is_available():
+    # Our kernels are fused: they derive g and beta from (a, b, A_log, dt_bias)
+    # internally and have no lower-bound variant. `lower_bound` (Bailing V3,
+    # upstream #1711) therefore forces the ops path, which takes g and beta as
+    # inputs. Correct but slow, which is fine -- we do not serve that model.
+    if (
+        lower_bound is not None
+        or not use_kernel
+        or mx.default_device() != mx.gpu
+        or not mx.metal.is_available()
+    ):
         beta = mx.sigmoid(b.astype(mx.float32))
-        g = compute_g(A_log, a, dt_bias)
+        if lower_bound is None:
+            g = compute_g(A_log, a, dt_bias)
+        else:
+            g = compute_lower_bound_g(A_log, a, dt_bias, lower_bound)
         y, state = gated_delta_ops(q, k, v, g, beta, state, mask)
         return y, state.astype(q.dtype)
 
