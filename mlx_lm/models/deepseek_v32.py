@@ -50,6 +50,7 @@ class ModelArgs(BaseModelArgs):
     rope_theta: float = 10000.0
     rope_scaling: Dict = None
     attention_bias: bool = False
+    indexer_rope_interleave: bool = False
 
 
 class Indexer(nn.Module):
@@ -71,7 +72,7 @@ class Indexer(nn.Module):
         self.rope = initialize_rope(
             dims=args.qk_rope_head_dim,
             base=args.rope_theta,
-            traditional=True,
+            traditional=args.indexer_rope_interleave,
             max_position_embeddings=args.max_position_embeddings,
             scaling_config=args.rope_scaling,
         )
@@ -99,7 +100,9 @@ class Indexer(nn.Module):
         k = self.rope(k, offset=offset)
 
         if cache is not None:
-            k, _ = cache.update_and_fetch(k, mx.zeros([b, 1, s, 0]))
+            k, _ = cache.update_and_fetch(k, k)
+            # Avoid unevaluated graph growing infinitely
+            cache.values = mx.zeros_like(cache.keys)
         if k.shape[2] <= self.index_topk:
             return None
 

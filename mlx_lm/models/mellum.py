@@ -1,13 +1,15 @@
 # Copyright © 2026 Apple Inc.
 
-from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Union
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
 
 from .activations import swiglu
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
+from .cache import KVCache, RotatingKVCache
+from .rope_utils import initialize_rope
 from .switch_layers import SwitchGLU
 
 
@@ -20,18 +22,34 @@ class ModelArgs(BaseModelArgs):
     num_attention_heads: int
     num_experts: int
     num_experts_per_tok: int
-    decoder_sparse_step: int
-    mlp_only_layers: List[int]
     moe_intermediate_size: int
     rms_norm_eps: float
     vocab_size: int
     num_key_value_heads: int
     head_dim: int
-    rope_theta: float
     tie_word_embeddings: bool
     max_position_embeddings: int
     norm_topk_prob: bool
-    rope_scaling: Optional[Dict[str, Union[float, str]]] = None
+    sliding_window: int
+    layer_types: List[str]
+    rope_parameters: Dict[str, Any] = field(default_factory=dict)
+
+
+def _rope_for(layer_type: str, args: ModelArgs):
+    params = args.rope_parameters[layer_type]
+    base = params["rope_theta"]
+    rope_type = params.get("rope_type", "default")
+    if rope_type in ("default", "linear"):
+        return initialize_rope(args.head_dim, base=base, traditional=False)
+    scaling_config = dict(params)
+    scaling_config["type"] = rope_type
+    return initialize_rope(
+        args.head_dim,
+        base=base,
+        traditional=False,
+        scaling_config=scaling_config,
+        max_position_embeddings=args.max_position_embeddings,
+    )
 
 
 class Attention(nn.Module):
@@ -40,12 +58,8 @@ class Attention(nn.Module):
 
         dim = args.hidden_size
         self.n_heads = n_heads = args.num_attention_heads
-        assert args.num_key_value_heads is not None
         self.n_kv_heads = n_kv_heads = args.num_key_value_heads
-
-        head_dim = getattr(
-            args, "head_dim", args.hidden_size // args.num_attention_heads
-        )
+        head_dim = args.head_dim
         self.scale = head_dim**-0.5
 
         self.q_proj = nn.Linear(dim, n_heads * head_dim, bias=False)
@@ -56,11 +70,7 @@ class Attention(nn.Module):
         self.q_norm = nn.RMSNorm(head_dim, eps=args.rms_norm_eps)
         self.k_norm = nn.RMSNorm(head_dim, eps=args.rms_norm_eps)
 
-        self.rope = nn.RoPE(
-            head_dim,
-            traditional=False,
-            base=args.rope_theta,
-        )
+        self.rope = _rope_for(args.layer_types[layer_idx], args)
 
     def __call__(
         self,
@@ -72,7 +82,6 @@ class Attention(nn.Module):
 
         queries, keys, values = self.q_proj(x), self.k_proj(x), self.v_proj(x)
 
-        # Prepare the queries, keys and values for the attention computation
         queries = self.q_norm(queries.reshape(B, L, self.n_heads, -1)).transpose(
             0, 2, 1, 3
         )
@@ -96,68 +105,41 @@ class Attention(nn.Module):
         return self.o_proj(output)
 
 
-class MLP(nn.Module):
-    def __init__(self, dim, hidden_dim):
-        super().__init__()
-        self.gate_proj = nn.Linear(dim, hidden_dim, bias=False)
-        self.down_proj = nn.Linear(hidden_dim, dim, bias=False)
-        self.up_proj = nn.Linear(dim, hidden_dim, bias=False)
-
-    def __call__(self, x) -> mx.array:
-        return self.down_proj(swiglu(self.gate_proj(x), self.up_proj(x)))
-
-
-class Qwen3MoeSparseMoeBlock(nn.Module):
+class MellumSparseMoeBlock(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
         dim = args.hidden_size
-        intermediate_size = args.moe_intermediate_size
-
-        self.num_experts = num_experts = args.num_experts
+        self.num_experts = args.num_experts
         self.top_k = args.num_experts_per_tok
         self.norm_topk_prob = args.norm_topk_prob
 
-        self.gate = nn.Linear(dim, num_experts, bias=False)
-        self.switch_mlp = SwitchGLU(dim, intermediate_size, num_experts)
+        self.gate = nn.Linear(dim, self.num_experts, bias=False)
+        self.switch_mlp = SwitchGLU(dim, args.moe_intermediate_size, self.num_experts)
 
-    def __call__(
-        self,
-        x: mx.array,
-    ) -> mx.array:
+    def __call__(self, x: mx.array) -> mx.array:
         gates = self.gate(x)
         gates = mx.softmax(gates, axis=-1, precise=True)
 
         k = self.top_k
         inds = mx.argpartition(gates, kth=-k, axis=-1)[..., -k:]
-        inds = mx.stop_gradient(inds)
         scores = mx.take_along_axis(gates, inds, axis=-1)
         if self.norm_topk_prob:
             scores /= mx.sum(scores, axis=-1, keepdims=True)
 
         y = self.switch_mlp(x, inds)
         y = (y * scores[..., None]).sum(axis=-2)
-
         return y
 
 
-class Qwen3MoeDecoderLayer(nn.Module):
+class MellumDecoderLayer(nn.Module):
     def __init__(self, args: ModelArgs, layer_idx: int):
         super().__init__()
-        self.hidden_size = args.hidden_size
         self.self_attn = Attention(args, layer_idx)
-
+        self.mlp = MellumSparseMoeBlock(args)
         self.input_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
         self.post_attention_layernorm = nn.RMSNorm(
             args.hidden_size, eps=args.rms_norm_eps
         )
-        self.args = args
-
-        if (layer_idx not in args.mlp_only_layers) and (
-            args.num_experts > 0 and (layer_idx + 1) % args.decoder_sparse_step == 0
-        ):
-            self.mlp = Qwen3MoeSparseMoeBlock(args)
-        else:
-            self.mlp = MLP(args.hidden_size, args.intermediate_size)
 
     def __call__(
         self,
@@ -168,23 +150,29 @@ class Qwen3MoeDecoderLayer(nn.Module):
         r = self.self_attn(self.input_layernorm(x), mask, cache)
         h = x + r
         r = self.mlp(self.post_attention_layernorm(h))
-        out = h + r
-        return out
+        return h + r
 
 
-class Qwen3MoeModel(nn.Module):
+class MellumModel(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.args = args
         self.vocab_size = args.vocab_size
-        self.num_hidden_layers = args.num_hidden_layers
         assert self.vocab_size > 0
         self.embed_tokens = nn.Embedding(args.vocab_size, args.hidden_size)
         self.layers = [
-            Qwen3MoeDecoderLayer(args=args, layer_idx=i)
+            MellumDecoderLayer(args=args, layer_idx=i)
             for i in range(args.num_hidden_layers)
         ]
         self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+
+        self._first_full = next(
+            i for i, t in enumerate(args.layer_types) if t == "full_attention"
+        )
+        self._first_sliding = next(
+            (i for i, t in enumerate(args.layer_types) if t == "sliding_attention"),
+            None,
+        )
 
     def __call__(
         self,
@@ -200,9 +188,16 @@ class Qwen3MoeModel(nn.Module):
         if cache is None:
             cache = [None] * len(self.layers)
 
-        mask = create_attention_mask(h, cache[0])
+        full_mask = create_attention_mask(h, cache[self._first_full])
+        if self._first_sliding is not None:
+            sliding_mask = create_attention_mask(
+                h, cache[self._first_sliding], window_size=self.args.sliding_window
+            )
+        else:
+            sliding_mask = None
 
-        for layer, c in zip(self.layers, cache):
+        for layer, c, t in zip(self.layers, cache, self.args.layer_types):
+            mask = full_mask if t == "full_attention" else sliding_mask
             h = layer(h, mask, c)
 
         return self.norm(h)
@@ -213,7 +208,7 @@ class Model(nn.Module):
         super().__init__()
         self.args = args
         self.model_type = args.model_type
-        self.model = Qwen3MoeModel(args)
+        self.model = MellumModel(args)
         if not args.tie_word_embeddings:
             self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
 
@@ -258,3 +253,12 @@ class Model(nn.Module):
     @property
     def layers(self):
         return self.model.layers
+
+    def make_cache(self):
+        caches = []
+        for t in self.args.layer_types:
+            if t == "full_attention":
+                caches.append(KVCache())
+            else:
+                caches.append(RotatingKVCache(max_size=self.args.sliding_window))
+        return caches

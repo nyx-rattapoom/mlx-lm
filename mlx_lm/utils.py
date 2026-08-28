@@ -9,6 +9,7 @@ import os
 import resource
 import shutil
 import struct
+from decimal import Decimal
 from pathlib import Path
 from textwrap import dedent
 from typing import (
@@ -53,19 +54,24 @@ MODEL_REMAPPING = {
     "qwen2_5_vl": "qwen2_vl",
     "minimax_m2": "minimax",
     "iquestcoder": "llama",
+    "gemma4_unified": "gemma4",  # encoder-free multimodal variant; vision/audio weights stripped by sanitize()
+}
+
+MODEL_ARCHITECTURE_REMAPPING = {
+    ("bailing_hybrid", "BailingMoeV3ForCausalLM"): "bailing_moe_v3",
 }
 
 MAX_FILE_SIZE_GB = 5
 
 
 def _parse_size(x):
-    sizes = {"M": 1e6, "G": 1e9, "MB": 1e6, "GB": 1e9, "": 1}
+    sizes = {"M": 10**6, "G": 10**9, "MB": 10**6, "GB": 10**9, "": 1}
     split = 0
     for xi in x:
         if not (xi.isdigit() or xi == "."):
             break
         split += 1
-    digits = float(x[:split])
+    digits = Decimal(x[:split])
     size = (x[split:]).strip().upper()
     return int(digits * sizes[size])
 
@@ -184,7 +190,16 @@ def _get_classes(config: dict):
         A tuple containing the Model class and the ModelArgs class.
     """
     model_type = config["model_type"]
-    model_type = MODEL_REMAPPING.get(model_type, model_type)
+    architectures = config.get("architectures") or ()
+    if isinstance(architectures, str):
+        architectures = (architectures,)
+    for architecture in architectures:
+        remapped = MODEL_ARCHITECTURE_REMAPPING.get((model_type, architecture))
+        if remapped is not None:
+            model_type = remapped
+            break
+    else:
+        model_type = MODEL_REMAPPING.get(model_type, model_type)
     try:
         arch = importlib.import_module(f"mlx_lm.models.{model_type}")
     except ImportError:
@@ -216,6 +231,19 @@ def compute_bits_per_weight(model):
     return model_bytes * 8 / model_params
 
 
+DEFAULT_ALLOW_PATTERNS = [
+    "*.json",
+    "model*.safetensors",
+    "*.py",
+    "tokenizer.model",
+    "*.tiktoken",
+    "tiktoken.model",
+    "*.txt",
+    "*.jsonl",
+    "*.jinja",
+]
+
+
 def _download(
     path_or_hf_repo: str,
     revision: Optional[str] = None,
@@ -235,17 +263,7 @@ def _download(
     model_path = Path(path_or_hf_repo)
 
     if not model_path.exists():
-        allow_patterns = allow_patterns or [
-            "*.json",
-            "model*.safetensors",
-            "*.py",
-            "tokenizer.model",
-            "*.tiktoken",
-            "tiktoken.model",
-            "*.txt",
-            "*.jsonl",
-            "*.jinja",
-        ]
+        allow_patterns = allow_patterns or DEFAULT_ALLOW_PATTERNS
         model_path = Path(
             snapshot_download(
                 path_or_hf_repo,
@@ -258,7 +276,16 @@ def _download(
 
 
 def hf_repo_to_path(hf_repo):
-    return Path(snapshot_download(hf_repo, local_files_only=True))
+    # Restrict to the same patterns that `_download` fetches so the snapshot
+    # completeness check does not fail on files that were never downloaded
+    # (e.g. `.gitattributes`), which would raise an IncompleteSnapshotError.
+    return Path(
+        snapshot_download(
+            hf_repo,
+            local_files_only=True,
+            allow_patterns=DEFAULT_ALLOW_PATTERNS,
+        )
+    )
 
 
 def load_config(model_path: Path) -> dict:
@@ -361,6 +388,7 @@ def load_model(
     strict: bool = True,
     model_config: Optional[Dict[str, Any]] = None,
     get_model_classes: Callable[[dict], Tuple[Type[nn.Module], Type]] = _get_classes,
+    trust_remote_code: bool = False,
 ) -> Tuple[nn.Module, dict]:
     """
     Load and initialize the model from a given path.
@@ -377,13 +405,18 @@ def load_model(
         get_model_classes (Callable[[dict], Tuple[Type[nn.Module], Type]], optional):
             A function that returns the model class and model args class given a config.
             Defaults to the ``_get_classes`` function.
+        trust_remote_code (bool): If ``True``, allow executing a custom model
+            architecture file specified by the config's ``model_file`` key.
+            Default: ``False``.
 
     Returns:
         Tuple[nn.Module, dict[str, Any]]: The loaded and initialized model and config.
 
     Raises:
         FileNotFoundError: If the weight files (.safetensors) are not found.
-        ValueError: If the model class or args class are not found or cannot be instantiated.
+        ValueError: If the model class or args class are not found or cannot be
+            instantiated, or if the config requests a custom ``model_file`` and
+            ``trust_remote_code`` is not enabled.
     """
     config = load_config(model_path)
     if model_config is not None:
@@ -404,6 +437,13 @@ def load_model(
             weights.update(_load_safetensors_with_e8m0(wf))
 
     if (model_file := config.get("model_file")) is not None:
+        if not trust_remote_code:
+            raise ValueError(
+                f"The model at {model_path} requires importing and running a "
+                f"custom module ({model_file!r}) to build its architecture. This "
+                "is disabled by default. Pass trust_remote_code=True if you "
+                "trust this model."
+            )
         spec = importlib.util.spec_from_file_location(
             "custom_model",
             model_path / model_file,
@@ -459,7 +499,10 @@ def load_model(
             config["quantization_config"] = quantization
             _quantize(quantization)
         elif quant_method == "compressed-tensors":
-            quantization = {"group_size": 32, "bits": 4, "mode": "affine"}
+            if quantization_config.get("format") == "nvfp4-pack-quantized":
+                quantization = {"group_size": 16, "bits": 4, "mode": "nvfp4"}
+            else:
+                quantization = {"group_size": 32, "bits": 4, "mode": "affine"}
             config["quantization"] = quantization
             config["quantization_config"] = quantization
             _quantize(quantization)
@@ -539,6 +582,7 @@ def load(
     lazy: bool = False,
     return_config: bool = False,
     revision: Optional[str] = None,
+    trust_remote_code: bool = False,
 ) -> Union[
     Tuple[nn.Module, TokenizerWrapper],
     Tuple[nn.Module, TokenizerWrapper, Dict[str, Any]],
@@ -559,6 +603,9 @@ def load(
             when needed. Default: ``False``
         return_config (bool: If ``True`` return the model config as the last item..
         revision (str, optional): A revision id which can be a branch name, a tag, or a commit hash.
+        trust_remote_code (bool): If ``True``, allow loading models that require
+            executing a custom Python file specified in their config.
+            Default: ``False``.
     Returns:
         Union[Tuple[nn.Module, TokenizerWrapper], Tuple[nn.Module, TokenizerWrapper, Dict[str, Any]]]:
             A tuple containing the loaded model, tokenizer and, if requested, the model config.
@@ -569,7 +616,12 @@ def load(
     """
     model_path = _download(path_or_hf_repo, revision=revision)
 
-    model, config = load_model(model_path, lazy, model_config=model_config)
+    model, config = load_model(
+        model_path,
+        lazy,
+        model_config=model_config,
+        trust_remote_code=trust_remote_code,
+    )
     if adapter_path is not None:
         model = load_adapters(model, adapter_path)
         model.eval()
@@ -590,6 +642,7 @@ def sharded_load(
     return_config: bool = False,
     *,
     tokenizer_config: Optional[Dict[str, Any]] = None,
+    trust_remote_code: bool = False,
 ):
     # Get model path with everything but weight safetensors
     model_path = _download(
@@ -608,7 +661,9 @@ def sharded_load(
 
     # Lazy load model to figure out what type of sharding we can do and which
     # weights we need to download.
-    model, config = load_model(model_path, lazy=True, strict=False)
+    model, config = load_model(
+        model_path, lazy=True, strict=False, trust_remote_code=trust_remote_code
+    )
 
     has_pipelining = hasattr(model, "model") and hasattr(model.model, "pipeline")
     has_tensor_parallel = hasattr(model, "shard")
@@ -657,7 +712,9 @@ def sharded_load(
         tokenizer_config or {"trust_remote_code": True},
         eos_token_ids=config.get("eos_token_id", None),
     )
-    model, _ = load_model(model_path, lazy=True, strict=False)
+    model, _ = load_model(
+        model_path, lazy=True, strict=False, trust_remote_code=trust_remote_code
+    )
     if tensor_group is not None:
         model.shard(tensor_group)
     if pipeline_group is not None:
@@ -1020,7 +1077,7 @@ def save(
         hf_repo = None
 
     dst_path = Path(dst_path)
-    save_model(dst_path, model, donate_model=True)
+    save_model(dst_path, model, donate_model=donate_model)
     save_config(config, config_path=dst_path / "config.json")
     tokenizer.save_pretrained(dst_path)
 
