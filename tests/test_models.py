@@ -1632,9 +1632,7 @@ class TestModels(unittest.TestCase):
         mixes = mx.random.normal(shape=(n, mix_hc))
         hc_scale = mx.ones((3,)) * 0.1
         hc_base = mx.zeros((mix_hc,))
-        _pre, _post, comb = hc_split_sinkhorn(
-            mixes, hc_scale, hc_base, hc, 20, 1e-6
-        )
+        _pre, _post, comb = hc_split_sinkhorn(mixes, hc_scale, hc_base, hc, 20, 1e-6)
         row_sums = comb.sum(axis=-1)
         col_sums = comb.sum(axis=-2)
         self.assertTrue(mx.all(mx.abs(row_sums - 1.0) < 1e-3))
@@ -3564,8 +3562,6 @@ class TestModels(unittest.TestCase):
         self.assertTrue(mx.allclose(out_state, out_state_m, atol=1e-4, rtol=1e-4))
 
     def test_gated_delta(self):
-        from mlx_lm.models.gated_delta import compute_g
-
         mx.random.seed(0)
         for B in [1, 2]:
             for T in [1, 2]:
@@ -3577,16 +3573,12 @@ class TestModels(unittest.TestCase):
                 q = mx.random.normal(shape=(B, T, Hk, Dk))
                 k = mx.random.normal(shape=(B, T, Hk, Dk))
                 v = mx.random.normal(shape=(B, T, Hv, Dv))
-                a = mx.random.normal(shape=(B, T, Hv))
-                b = mx.random.normal(shape=(B, T, Hv))
-                A_log = mx.random.normal(shape=(Hv,))
-                dt_bias = mx.random.normal(shape=(Hv,))
+                g = mx.random.uniform(shape=(B, T, Hv))
+                beta = mx.random.uniform(shape=(B, T, Hv))
                 state = mx.random.normal(shape=(B, Hv, Dk, Dv))
 
-                g = compute_g(A_log, a, dt_bias)
-                beta = mx.sigmoid(b)
                 y_op, st_op = gated_delta_ops(q, k, v, g, beta, state)
-                y_c, st_c = gated_delta_kernel(q, k, v, a, b, A_log, dt_bias, state)
+                y_c, st_c = gated_delta_kernel(q, k, v, g, beta, state)
                 self.assertTrue(mx.allclose(y_op, y_c, rtol=1e-4, atol=1e-4))
                 self.assertTrue(mx.allclose(st_op, st_c, rtol=1e-4, atol=1e-4))
 
@@ -3675,8 +3667,6 @@ class TestModels(unittest.TestCase):
             self.assertTrue(mx.allclose(y_lo, y_ref, rtol=0.05, atol=0.01))
 
     def test_gated_delta_masked(self):
-        from mlx_lm.models.gated_delta import compute_g
-
         B = 1
         T = 3
         Hk = 16
@@ -3688,14 +3678,9 @@ class TestModels(unittest.TestCase):
         q = mx.random.normal(shape=(B, T, Hk, Dk))
         k = mx.random.normal(shape=(B, T, Hk, Dk))
         v = mx.random.normal(shape=(B, T, Hv, Dv))
-        a = mx.random.normal(shape=(B, T, Hv))
-        b = mx.random.normal(shape=(B, T, Hv))
-        A_log = mx.random.normal(shape=(Hv,))
-        dt_bias = mx.random.normal(shape=(Hv,))
+        g = mx.random.normal(shape=(B, T, Hv))
+        beta = mx.random.normal(shape=(B, T, Hv))
         state = mx.random.normal(shape=(B, Hv, Dk, Dv))
-
-        g = compute_g(A_log, a, dt_bias)
-        beta = mx.sigmoid(b)
 
         for s, e, mask in [
             (1, 3, mx.array([[False, True, True]])),
@@ -3709,13 +3694,11 @@ class TestModels(unittest.TestCase):
                 beta[:, s:e],
                 state,
             )
-            y_ops, st_ops = gated_delta_ops(q, k, v, g, beta, state, mask)
-            self.assertTrue(mx.allclose(y_ops[:, s:e], y_gt, rtol=1e-4, atol=1e-4))
-            self.assertTrue(mx.allclose(st_ops, st_gt, rtol=1e-4, atol=1e-3))
-
-            y_k, st_k = gated_delta_kernel(q, k, v, a, b, A_log, dt_bias, state, mask)
-            self.assertTrue(mx.allclose(y_k[:, s:e], y_gt, rtol=1e-4, atol=1e-4))
-            self.assertTrue(mx.allclose(st_k, st_gt, rtol=1e-4, atol=1e-3))
+            for fn in [gated_delta_ops, gated_delta_kernel]:
+                y, st = fn(q, k, v, g, beta, state, mask)
+                y = y[:, s:e]
+                self.assertTrue(mx.allclose(y, y_gt, rtol=1e-4, atol=1e-4))
+                self.assertTrue(mx.allclose(st, st_gt, rtol=1e-4, atol=1e-3))
 
 
 if __name__ == "__main__":
