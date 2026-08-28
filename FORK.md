@@ -26,10 +26,15 @@ behavioural difference is bf16 `beta` precision, which perturbs an occasional re
 token without changing the final answer at 32k. Carrying a hand-maintained kernel that
 conflicts with every upstream merge was not buying anything measurable.
 
-> The fused lineage is **not lost**. It is preserved at branch
-> `internal-use-fused-gdn-2026-08-28` (`9494098796e888b4d96d8d0c009b65a236e2f662`), and the
-> matching exo commit at `nyx-rattapoom/exo` `internal-use-fused-gdn-2026-08-28`
+> The fused lineage is **not lost**. In this repo it is preserved at branch
+> **`internal-use-legacy`** (`9494098796e888b4d96d8d0c009b65a236e2f662`) — the same commit that
+> `internal-use` still points at, so it is doubly referenced. The matching exo commit is at
+> `nyx-rattapoom/exo` `internal-use-fused-gdn-2026-08-28`
 > (`d3db334b65e295ae014594bd60d12a78ea4af105`).
+>
+> ⚠️ The two repos use different names for the same keep-alive: this repo's branch was renamed
+> from `internal-use-fused-gdn-2026-08-28` to `internal-use-legacy` on 2026-08-29, while exo's
+> kept the dated name. GitHub redirects the old name, but write the new one.
 
 ## What this branch still diverges from upstream on
 
