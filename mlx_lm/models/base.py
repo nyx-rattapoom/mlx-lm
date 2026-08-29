@@ -1,11 +1,38 @@
 # Copyright © 2023-2024 Apple Inc.
 
 import inspect
+import os
 from dataclasses import dataclass
 from typing import Any, Optional
 
 import mlx.core as mx
 from mlx.utils import tree_map
+
+# Fused-SDPA routing for head dims upstream mlx deliberately runs UNFUSED on
+# non-NAX GPUs (192/256): the unfused path materialises the full
+# [heads, q_len, kv_len] score matrix (2 GiB at 32k, 8 GiB at 128k for a
+# 16-head/2048-token prefill chunk).  When the mlx build exposes `force_fused`
+# we ask for the fused kernel on prefill calls with those head dims.  Decode
+# (q_len <= 8) is left to mlx.  `MLX_LM_FORCE_FUSED_SDPA=0` disables it.  Read
+# once at import, so it is launch-time only.
+_FORCE_FUSED_SUPPORTED = "force_fused" in (
+    mx.fast.scaled_dot_product_attention.__doc__ or ""
+)
+_FORCE_FUSED_ENABLED = _FORCE_FUSED_SUPPORTED and os.environ.get(
+    "MLX_LM_FORCE_FUSED_SDPA", "1"
+) not in ("0", "false", "False")
+_FORCE_FUSED_HEAD_DIMS = (192, 256)
+
+
+def sdpa_config():
+    return {
+        "force_fused_supported": _FORCE_FUSED_SUPPORTED,
+        "force_fused_enabled": _FORCE_FUSED_ENABLED,
+        "head_dims": _FORCE_FUSED_HEAD_DIMS,
+    }
+
+
+print(f"SDPA config: {sdpa_config()}", flush=True)
 
 
 @dataclass
@@ -129,6 +156,13 @@ def scaled_dot_product_attention(
             bits=cache.bits,
         )
     else:
+        kwargs = {}
+        if (
+            _FORCE_FUSED_ENABLED
+            and queries.shape[2] > 8
+            and queries.shape[-1] in _FORCE_FUSED_HEAD_DIMS
+        ):
+            kwargs["force_fused"] = True
         return mx.fast.scaled_dot_product_attention(
             queries,
             keys,
@@ -136,4 +170,5 @@ def scaled_dot_product_attention(
             scale=scale,
             mask=mask,
             sinks=sinks,
+            **kwargs,
         )
