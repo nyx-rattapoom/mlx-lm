@@ -1,6 +1,6 @@
 # About this branch
 
-`internal-use-upstream-gdn` is a fork of
+`internal-use` is a fork of
 [`rltakashige/mlx-lm@leo/deepseek-v4`](https://github.com/rltakashige/mlx-lm/tree/leo/deepseek-v4)
 with current [`ml-explore/mlx-lm`](https://github.com/ml-explore/mlx-lm) `main` merged in.
 
@@ -16,7 +16,7 @@ so this branch is "exo's own dependency, brought up to date".
 
 ## Why this branch exists, and what changed
 
-The previous lineage (`internal-use`) carried a **fused** gated-delta kernel that computed
+The previous lineage (`internal-use-legacy`, which was named `internal-use` until 2026-08-30) carried a **fused** gated-delta kernel that computed
 `g` and `beta` in fp32 inside the Metal kernel. This branch drops that and takes upstream's
 **unfused** packed kernel instead.
 
@@ -27,14 +27,13 @@ token without changing the final answer at 32k. Carrying a hand-maintained kerne
 conflicts with every upstream merge was not buying anything measurable.
 
 > The fused lineage is **not lost**. In this repo it is preserved at branch
-> **`internal-use-legacy`** (`9494098796e888b4d96d8d0c009b65a236e2f662`) — the same commit that
-> `internal-use` still points at, so it is doubly referenced. The matching exo commit is at
-> `nyx-rattapoom/exo` `internal-use-fused-gdn-2026-08-28`
-> (`d3db334b65e295ae014594bd60d12a78ea4af105`).
+> **`internal-use-legacy`** (`9494098796e888b4d96d8d0c009b65a236e2f662`). The matching exo commit
+> is at `nyx-rattapoom/exo` **`internal-use-legacy`** (`d3db334b65e295ae014594bd60d12a78ea4af105`).
 >
-> ⚠️ The two repos use different names for the same keep-alive: this repo's branch was renamed
-> from `internal-use-fused-gdn-2026-08-28` to `internal-use-legacy` on 2026-08-29, while exo's
-> kept the dated name. GitHub redirects the old name, but write the new one.
+> Naming history: this branch was developed as `internal-use-upstream-gdn` and renamed to
+> `internal-use` on 2026-08-30 once it was the only live lineage (exo pins it by that name).
+> The 2026-08-28/29 dated keep-alive branches were deleted the same day — every commit they
+> pointed at is an ancestor of `internal-use` or `internal-use-legacy`.
 
 ## What this branch still diverges from upstream on
 
@@ -80,7 +79,7 @@ mlx. `force_fused` raises rather than silently falling back if no fused kernel e
 ## Installing
 
 ```sh
-uv add "mlx-lm @ git+https://github.com/nyx-rattapoom/mlx-lm@internal-use-upstream-gdn"
+uv add "mlx-lm @ git+https://github.com/nyx-rattapoom/mlx-lm@internal-use"
 ```
 
 Not published to PyPI. Everything in the [upstream README](./README.md) otherwise applies.
