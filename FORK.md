@@ -48,26 +48,34 @@ conflicts with every upstream merge was not buying anything measurable.
   production, so this branch changes the GDN kernel and nothing else in that model's path.
 - **`mlx_lm/generate.py`** — keeps the base branch's `_as_array` logprobs-normalisation helper
   on top of upstream's `stop_matchers` rename. Both are required; see the merge commit.
-- **`setup.py`** — see below.
+- **`mlx_lm/models/base.py`** — fused-SDPA routing for head_dim 192/256, see below.
 
-## `setup.py` pins a lower MLX floor than upstream
+## Runs on stock `mlx` (PyPI, >= 0.32.1) — and forces the fused SDPA kernel
 
-Upstream [#1753](https://github.com/ml-explore/mlx-lm/pull/1753) raised `MIN_MLX_VERSION` to
-`0.32.1`. **This branch holds it at `0.31.2`**, and that override must be re-applied on every
-future upstream merge — `setup.py` does not otherwise conflict, so it will silently take
-upstream's value unless someone acts.
+Since 2026-08-30 exo pins **PyPI `mlx==0.32.2`** instead of the
+`rltakashige/mlx-jaccl-fix-small-recv` fork, so this branch keeps upstream's
+`MIN_MLX_VERSION = "0.32.1"` unchanged (the earlier `0.31.2` override, `f68463d5`, is reverted).
 
-The reason is exo's mlx pin, and it is not a matter of taste. Checked 2026-08-28:
+Moving to stock mlx exposed one dispatch difference that matters on 24 GB nodes. For
+`head_dim` **192 / 256** prefill (`q_len > 8`) upstream mlx's `ScaledDotProductAttention::use_fallback`
+deliberately takes the **unfused** path on GPUs without NAX ("unfused is faster for these shapes"),
+which materialises the full `[heads, q_len, kv_len]` bf16 score matrix: for a 16-head model with a
+2048-token prefill chunk that is **2 GiB at 32k context and 8 GiB at 128k**. The fork mlx ran those
+head dims through its fused steel kernel and never allocated it. Measured on 2x M4: stock-unfused
+was +9.5 % on attention time at 32k but OOMed 128k 3/3; stock with `force_fused=True` fits 128k with
+a peak **byte-identical** to the fork build and ties it on decode.
 
-- upstream exo `main` pins `mlx==0.32.0` →
-  `rltakashige/mlx-jaccl-fix-small-recv@address-rdma-gpu-locks#cc3f3e60`;
-- that branch's head (`e9835615`, one commit ahead of the pin) **still reports
-  `MLX_VERSION 0.32.0`** in `mlx/version.h`.
+So `mlx_lm/models/base.py:scaled_dot_product_attention` passes `force_fused=True` on prefill calls
+with `head_dim in (192, 256)` **when the running mlx exposes that kwarg** (detected once at import from
+the nanobind docstring; older/fork mlx builds see a silent no-op). Decode (`q_len <= 8`) is left to
+mlx. `force_fused` raises rather than silently falling back if no fused kernel exists for a shape.
 
-So no build of exo's mlx satisfies `>=0.32.1` today, and upstream exo has not moved. Keeping
-the floor at `0.31.2` is what lets exo's `uv lock` resolve at all. Revisit when upstream exo
-adopts an mlx that reports `0.32.1` or newer — and follow upstream exo's pin rather than
-jumping ahead of it.
+- Kill switch: `MLX_LM_FORCE_FUSED_SDPA=0` (read at import — launch-time only, like `MLX_GDN_PACKED`).
+- Fingerprint: every process prints one line
+  `SDPA config: {'force_fused_supported': ..., 'force_fused_enabled': ..., 'head_dims': (192, 256)}`;
+  `mlx_lm.models.base.sdpa_config()` returns the same dict.
+- Upstream tracking: this is a fork-only routing decision. If upstream ever changes the 192/256
+  routing (or exposes a global switch), drop this block and follow upstream.
 
 ## Installing
 
