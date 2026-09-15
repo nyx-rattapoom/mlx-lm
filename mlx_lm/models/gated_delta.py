@@ -15,7 +15,13 @@ _ENABLE_GDN_PACKED = os.environ.get("MLX_GDN_PACKED", "1") != "0"
 
 @partial(mx.compile, shapeless=True)
 def compute_g(A_log, a, dt_bias):
-    return mx.exp(-mx.exp(A_log.astype(mx.float32)) * nn.softplus(a + dt_bias))
+    # Fork delta: compute the softplus gate in f32. In bf16 the gate is quantised
+    # before it ever reaches the kernel, and that error compounds through the
+    # recurrent f32 state.
+    return mx.exp(
+        -mx.exp(A_log.astype(mx.float32))
+        * nn.softplus(a.astype(mx.float32) + dt_bias.astype(mx.float32))
+    )
 
 
 @partial(mx.compile, shapeless=True)
@@ -23,7 +29,9 @@ def compute_lower_bound_g(A_log, a, dt_bias, lower_bound):
     return mx.exp(
         lower_bound
         * mx.sigmoid(
-            mx.exp(A_log.astype(mx.float32)) * (a.astype(mx.float32) + dt_bias)
+            # Fork delta: f32 gate, as in compute_g above.
+            mx.exp(A_log.astype(mx.float32))
+            * (a.astype(mx.float32) + dt_bias.astype(mx.float32))
         )
     )
 
@@ -599,7 +607,11 @@ def gated_delta_update(
     use_kernel: bool = True,
     lower_bound: float | None = None,
 ) -> Tuple[mx.array, mx.array]:
-    beta = mx.sigmoid(b)
+    # Fork delta: f32 beta. A bf16 sigmoid quantises beta before the kernel sees
+    # it, and the error compounds in the recurrent f32 state (~37000x worse state
+    # error measured on M4, 2026-08-28). g and beta are untemplated float buffers
+    # in the Metal kernels, so an f32 beta binds correctly.
+    beta = mx.sigmoid(b.astype(mx.float32))
     if lower_bound is None:
         g = compute_g(A_log, a, dt_bias)
     else:

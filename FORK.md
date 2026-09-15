@@ -8,7 +8,7 @@ with current [`ml-explore/mlx-lm`](https://github.com/ml-explore/mlx-lm) `main` 
 |---|---|
 | Base | `rltakashige/mlx-lm` `leo/deepseek-v4` @ `6a3df6cd6b00a347ee40f12d97a182aaf86ea599` |
 | Upstream merged | `ml-explore/mlx-lm` `main` @ `1f9883c91ab726c6a44fc0249adbfea283ca0b33` |
-| GDN kernel | **upstream's** (PR #1559), `gated_delta.py` sha256 `d97103bc…3cf72b` |
+| GDN kernel | **upstream's** (PR #1559) + an f32 gate/beta fix, `gated_delta.py` sha256 `7dfe16b6…262621c0` |
 
 The base branch is what upstream [exo](https://github.com/exo-explore/exo) itself pins
 (`pyproject.toml`: `mlx-lm = { git = ".../rltakashige/mlx-lm", branch = "leo/deepseek-v4" }`),
@@ -18,7 +18,8 @@ so this branch is "exo's own dependency, brought up to date".
 
 The previous lineage (`internal-use-legacy`, which was named `internal-use` until 2026-08-30) carried a **fused** gated-delta kernel that computed
 `g` and `beta` in fp32 inside the Metal kernel. This branch drops that and takes upstream's
-**unfused** packed kernel instead.
+**unfused** packed kernel instead, with one numerical fix layered on top (see
+*f32 gate and beta* below).
 
 That was a measured decision, not a preference. On the 2-node M4 cluster the two kernels
 **tie** end-to-end at 32k and 128k, upstream costs a constant **+275 KiB**, and the only
@@ -48,6 +49,34 @@ conflicts with every upstream merge was not buying anything measurable.
 - **`mlx_lm/generate.py`** — keeps the base branch's `_as_array` logprobs-normalisation helper
   on top of upstream's `stop_matchers` rename. Both are required; see the merge commit.
 - **`mlx_lm/models/base.py`** — fused-SDPA routing for head_dim 192/256, see below.
+- **`mlx_lm/models/gated_delta.py`** — the gate and `beta` are computed in f32, see below.
+
+## f32 gate and beta in the GDN kernel path
+
+Upstream's `gated_delta.py` computes both gating terms in the activation dtype, which for
+Qwen3.6 is bf16: `beta = mx.sigmoid(b)` and `nn.softplus(a + dt_bias)`. This branch casts
+their inputs to f32 first, so the gate and `beta` reach the Metal kernel in f32:
+
+- `compute_g` - `nn.softplus(a.astype(f32) + dt_bias.astype(f32))`
+- `compute_lower_bound_g` - the same cast on `dt_bias` (this path never runs for Qwen3.6; kept consistent)
+- `gated_delta_update` - `beta = mx.sigmoid(b.astype(f32))`
+
+Why it matters: the delta rule carries an **f32 recurrent state**, so a `beta` quantised to
+bf16 before the kernel ever sees it injects error at every timestep and compounds it. The
+2-node M4 A/B of this kernel against the older fused one (which did the same arithmetic
+inside the kernel) found bf16 `beta` to be **100% of the accuracy gap**: 1.8x the
+quantisation floor on `y`, and ~37,000x worse error on the carried state. Feeding the same
+kernel an f32 `beta` collapsed the gap entirely.
+[adurham/mlx-lm](https://github.com/adurham/mlx-lm) made the same fix independently, citing
+GDN state drift over long decodes measured against the vLLM/Triton reference.
+
+This binds with no kernel change: the Metal kernels template only `InT` (q/k/v) and `StT`
+(state), while `g` and `beta` are ordinary input buffers whose Metal parameter type follows
+each array's own dtype. `g` was already f32 - only the arithmetic producing it was bf16 - so
+the packed kernel's `g.dtype == float32` eligibility check is unaffected.
+
+This is an accuracy/stability change, not a performance one: expect a throughput tie and a
+forked-but-equivalent reasoning stream under greedy decoding.
 
 ## Runs on stock `mlx` (PyPI, >= 0.32.1) — and forces the fused SDPA kernel
 
