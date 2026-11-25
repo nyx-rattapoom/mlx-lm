@@ -1,109 +1,81 @@
 # About this branch
 
-`internal-use` is a fork of
-[`rltakashige/mlx-lm@leo/deepseek-v4`](https://github.com/rltakashige/mlx-lm/tree/leo/deepseek-v4)
-with current [`ml-explore/mlx-lm`](https://github.com/ml-explore/mlx-lm) `main` merged in.
+`internal-use` is [`ml-explore/mlx-lm`](https://github.com/ml-explore/mlx-lm) `main` plus three
+small patches. It is what [`nyx-rattapoom/exo`](https://github.com/nyx-rattapoom/exo) `internal-use`
+pins, on a two-node Apple M4 (24 GB) cluster.
 
 | | |
 |---|---|
-| Base | `rltakashige/mlx-lm` `leo/deepseek-v4` @ `6a3df6cd6b00a347ee40f12d97a182aaf86ea599` |
-| Upstream merged | `ml-explore/mlx-lm` `main` @ `1f9883c91ab726c6a44fc0249adbfea283ca0b33` |
-| GDN kernel | **upstream's** (PR #1559) + an f32 gate/beta fix, `gated_delta.py` sha256 `7dfe16b6…262621c0` |
+| Upstream merged | `ml-explore/mlx-lm` `main` @ `6b572ab1b531dd8fd2d13f6f36a89c2eccda18ea` (2026-10-30), merged 2026-11-26 (`025b742`): the rev upstream exo pins since exo#2509 |
+| Diverges in | `mlx_lm/models/base.py`, `mlx_lm/models/gated_delta.py`, `mlx_lm/models/cache.py` |
+| Needs | `mlx >= 0.32.3` (exo runs the PyPI 0.32.4 wheel) |
+| Previous lineage | `backup/internal-use-60f738d9` (branch): `rltakashige/mlx-lm@leo/deepseek-v4` + upstream `1f9883c9`, which exo pinned until 2026-11-26 |
 
-The base branch is what upstream [exo](https://github.com/exo-explore/exo) itself pins
-(`pyproject.toml`: `mlx-lm = { git = ".../rltakashige/mlx-lm", branch = "leo/deepseek-v4" }`),
-so this branch is "exo's own dependency, brought up to date".
+Until 2026-11-26 this branch was a fork of `rltakashige/mlx-lm@leo/deepseek-v4`, because exo
+imported `mlx_lm.models.deepseek_v4` and that module only existed there. Upstream exo now ships
+DeepSeek V4 itself (`exo/worker/engines/mlx/models/deepseek_v4/`) and pins stock mlx-lm, and its
+registry test requires that mlx-lm has **no** `deepseek_v4` model type. So the base-branch
+DeepSeek V4 code (model, chat template, convert/tokenizer hooks, e8m0 loader, deepseek_v32
+changes) was dropped in `90226c1`. The base branch's cache fixes stay.
 
-## Why this branch exists, and what changed
+## What this branch diverges from upstream on
 
-The previous lineage (`internal-use-legacy`, which was named `internal-use` until 2026-08-30) carried a **fused** gated-delta kernel that computed
-`g` and `beta` in fp32 inside the Metal kernel. This branch drops that and takes upstream's
-**unfused** packed kernel instead, with one numerical fix layered on top (see
-*f32 gate and beta* below).
+### force_fused SDPA for head_dim 192/256 (`models/base.py`)
 
-That was a measured decision, not a preference. On the 2-node M4 cluster the two kernels
-**tie** end-to-end at 32k and 128k, upstream costs a constant **+275 KiB**, and the only
-behavioural difference is bf16 `beta` precision, which perturbs an occasional reasoning
-token without changing the final answer at 32k. Carrying a hand-maintained kernel that
-conflicts with every upstream merge was not buying anything measurable.
+For `head_dim` **192 / 256** prefill (`q_len > 8`), stock mlx's `ScaledDotProductAttention::use_fallback`
+takes the **unfused** path on GPUs without NAX (M4 included). That path materialises the full
+`[heads, q_len, kv_len]` bf16 score matrix: for a 16-head model with a 2048-token prefill chunk,
+**2 GiB at 32k and 8 GiB at 128k**. Measured on 2× M4: unfused was +9.5 % on attention time at 32k
+and **OOMed 128k 3/3**; `force_fused=True` fits 128k and ties on decode. Still needed on mlx 0.32.4:
+on non-NAX GPUs it adds a fused case for head_dim 256 only when `q_len >= 2048` **and** `q_len == kv_len`,
+i.e. the first chunk of a prefill. Every later chunk (`q_len < kv_len`) still takes the unfused path.
 
-> The fused lineage is **not lost**. In this repo it is preserved at branch
-> **`internal-use-legacy`** (`9494098796e888b4d96d8d0c009b65a236e2f662`). The matching exo commit
-> is at `nyx-rattapoom/exo` **`internal-use-legacy`** (`d3db334b65e295ae014594bd60d12a78ea4af105`).
->
-> Naming history: this branch was developed as `internal-use-upstream-gdn` and renamed to
-> `internal-use` on 2026-08-30 once it was the only live lineage (exo pins it by that name).
-> The 2026-08-28/29 dated keep-alive branches were deleted the same day — every commit they
-> pointed at is an ancestor of `internal-use` or `internal-use-legacy`.
+`scaled_dot_product_attention` passes `force_fused=True` on prefill calls with those head dims when the
+running mlx exposes the kwarg (detected once at import from the nanobind docstring). Decode is left to mlx.
 
-## What this branch still diverges from upstream on
+- Kill switch: `MLX_LM_FORCE_FUSED_SDPA=0` (read at import, so launch-time only).
+- Fingerprint: every process prints
+  `SDPA config: {'force_fused_supported': ..., 'force_fused_enabled': ..., 'head_dims': (192, 256)}`.
+- Drop this block if upstream mlx ever changes the 192/256 routing for non-NAX GPUs.
 
-- **DeepSeek V4** — `mlx_lm/models/deepseek_v4.py` and `mlx_lm/chat_templates/deepseek_v4.py`
-  exist only here and on the base branch. exo imports `mlx_lm.models.deepseek_v4` at module
-  scope in several files, so **a repin to plain upstream `main` breaks every runner at model
-  load**. This is the reason the relationship with upstream is a merge, never a repin.
-- **DeepSeek V3.2**, `convert.py`, `tokenizer_utils.py` — base-branch changes, carried through.
-- **`mlx_lm/models/qwen3_5.py`** — keeps a manual `mx.rsqrt` q/k normalisation where upstream
-  uses `mx.fast.rms_norm`. Deliberate: it is byte-identical to the file currently served in
-  production, so this branch changes the GDN kernel and nothing else in that model's path.
-- **`mlx_lm/generate.py`** — keeps the base branch's `_as_array` logprobs-normalisation helper
-  on top of upstream's `stop_matchers` rename. Both are required; see the merge commit.
-- **`mlx_lm/models/base.py`** — fused-SDPA routing for head_dim 192/256, see below.
-- **`mlx_lm/models/gated_delta.py`** — the gate and `beta` are computed in f32, see below.
+### f32 gate and beta in the GDN kernel path (`models/gated_delta.py`)
 
-## f32 gate and beta in the GDN kernel path
+Upstream computes the gating terms in the activation dtype (bf16 for Qwen3.5/3.6):
+`beta = mx.sigmoid(b)` and `nn.softplus(a + dt_bias)`. Here their inputs are cast to f32 first
+(`compute_g`, `compute_lower_bound_g`'s `dt_bias`, and `gated_delta_update`'s `beta`, which then
+doubles for `allow_neg_eigval`). The delta rule carries an f32 recurrent state, so a bf16 `beta`
+injects error at every step and compounds it: on the 2-node M4 A/B against the older fused kernel,
+bf16 `beta` was 100 % of the accuracy gap (~37,000× worse state error); f32 closed it.
+[adurham/mlx-lm](https://github.com/adurham/mlx-lm) made the same fix independently. No kernel change
+is needed: `g` and `beta` are untemplated float buffers in the Metal kernels. Expect a throughput tie.
 
-Upstream's `gated_delta.py` computes both gating terms in the activation dtype, which for
-Qwen3.6 is bf16: `beta = mx.sigmoid(b)` and `nn.softplus(a + dt_bias)`. This branch casts
-their inputs to f32 first, so the gate and `beta` reach the Metal kernel in f32:
+### ArraysCache / BatchKVCache fixes from the base branch (`models/cache.py`)
 
-- `compute_g` - `nn.softplus(a.astype(f32) + dt_bias.astype(f32))`
-- `compute_lower_bound_g` - the same cast on `dt_bias` (this path never runs for Qwen3.6; kept consistent)
-- `gated_delta_update` - `beta = mx.sigmoid(b.astype(f32))`
+- `ArraysCache.extract` and `merge` keep a slot that is `None` in every batch item as `None` instead of
+  failing on it.
+- `BatchKVCache.update_and_fetch` makes `keys` depend on `offset` and `left_padding`
+  (`mx.depends`), so they are evaluated each step instead of building an ever-longer lazy graph (the
+  "ArraysCache leak" the base branch reproduced).
 
-Why it matters: the delta rule carries an **f32 recurrent state**, so a `beta` quantised to
-bf16 before the kernel ever sees it injects error at every timestep and compounds it. The
-2-node M4 A/B of this kernel against the older fused one (which did the same arithmetic
-inside the kernel) found bf16 `beta` to be **100% of the accuracy gap**: 1.8x the
-quantisation floor on `y`, and ~37,000x worse error on the carried state. Feeding the same
-kernel an f32 `beta` collapsed the gap entirely.
-[adurham/mlx-lm](https://github.com/adurham/mlx-lm) made the same fix independently, citing
-GDN state drift over long decodes measured against the vLLM/Triton reference.
+Both matter only to batched generation (exo's `BatchGenerator`); exo's MTP path runs batch size 1.
 
-This binds with no kernel change: the Metal kernels template only `InT` (q/k/v) and `StT`
-(state), while `g` and `beta` are ordinary input buffers whose Metal parameter type follows
-each array's own dtype. `g` was already f32 - only the arithmetic producing it was bf16 - so
-the packed kernel's `g.dtype == float32` eligibility check is unaffected.
+## Taken from upstream on the 2026-11-26 merge (no longer diverging)
 
-This is an accuracy/stability change, not a performance one: expect a throughput tie and a
-forked-but-equivalent reasoning stream under greedy decoding.
+- `models/qwen3_5.py`: upstream's `normalize_qk` (`mx.fast.rms_norm`) replaces the manual `mx.rsqrt`
+  q/k normalisation this branch kept to stay byte-identical with the build served in August. exo's MTP
+  verify pass uses the same `normalize_qk`.
+- `generate.py`: upstream's file. The base branch kept a step's logprobs as one array; exo now does
+  that itself by patching `GenerationBatch._step`/`extend` (`exo/worker/engines/mlx/patches/opt_batch_gen.py`).
 
-## Runs on stock `mlx` (PyPI, >= 0.32.1) — and forces the fused SDPA kernel
+## The branch name is load-bearing
 
-Since 2026-08-30 exo pins **PyPI `mlx==0.32.2`** instead of the
-`rltakashige/mlx-jaccl-fix-small-recv` fork, so this branch keeps upstream's
-`MIN_MLX_VERSION = "0.32.1"` unchanged (the earlier `0.31.2` override, `f68463d5`, is reverted).
+exo pins this repo **by branch name** (`mlx-lm = { git = "...", branch = "internal-use" }`), so renaming or
+deleting `internal-use` breaks every from-scratch exo build, and anything pushed here is what exo's next
+`uv lock` picks up (an existing `uv.lock` stays on its recorded SHA). Do not use it as a scratch branch.
 
-Moving to stock mlx exposed one dispatch difference that matters on 24 GB nodes. For
-`head_dim` **192 / 256** prefill (`q_len > 8`) upstream mlx's `ScaledDotProductAttention::use_fallback`
-deliberately takes the **unfused** path on GPUs without NAX ("unfused is faster for these shapes"),
-which materialises the full `[heads, q_len, kv_len]` bf16 score matrix: for a 16-head model with a
-2048-token prefill chunk that is **2 GiB at 32k context and 8 GiB at 128k**. The fork mlx ran those
-head dims through its fused steel kernel and never allocated it. Measured on 2x M4: stock-unfused
-was +9.5 % on attention time at 32k but OOMed 128k 3/3; stock with `force_fused=True` fits 128k with
-a peak **byte-identical** to the fork build and ties it on decode.
-
-So `mlx_lm/models/base.py:scaled_dot_product_attention` passes `force_fused=True` on prefill calls
-with `head_dim in (192, 256)` **when the running mlx exposes that kwarg** (detected once at import from
-the nanobind docstring; older/fork mlx builds see a silent no-op). Decode (`q_len <= 8`) is left to
-mlx. `force_fused` raises rather than silently falling back if no fused kernel exists for a shape.
-
-- Kill switch: `MLX_LM_FORCE_FUSED_SDPA=0` (read at import — launch-time only, like `MLX_GDN_PACKED`).
-- Fingerprint: every process prints one line
-  `SDPA config: {'force_fused_supported': ..., 'force_fused_enabled': ..., 'head_dims': (192, 256)}`;
-  `mlx_lm.models.base.sdpa_config()` returns the same dict.
-- Upstream tracking: this is a fork-only routing decision. If upstream ever changes the 192/256
-  routing (or exposes a global switch), drop this block and follow upstream.
+Tags: the package version comes from `git describe` (setuptools-scm). A tag reachable from this branch
+whose name does not parse as a version (e.g. `backup/...`) breaks every build of it, so keep backups as
+**branches**. Upstream's release tags `v0.32.0`–`v0.32.2` are mirrored here so the version reads `0.32.3.devN`.
 
 ## Installing
 
